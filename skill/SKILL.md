@@ -19,7 +19,7 @@ description: Verwaltet Lima-VMs auf diesem Mac mit dem Werkzeug `labvm` (Hierarc
 ## Befehle
 ```
 labvm ls [ordner]                      Baum: Status, Zustand (gepackt/ausgepackt), Mac-GB
-labvm new 40c3/workshop/vm1 [--cpus 4 --memory 8GiB --disk 60GiB] [--compress pack|none] [--no-gui] [--no-provision] [--no-share] [--mount MAC:VM] [--start]
+labvm new 40c3/workshop/vm1 [--cpus 4 --memory 8GiB --disk 60GiB] [--compress pack|fs|none] [--no-gui] [--no-provision] [--no-share] [--mount MAC:VM] [--start]
 labvm start|run NAME                   entpacken + starten (run: im Vordergrund bis zum Ende, dann packen)
 labvm stop NAME|ORDNER [--force]       stoppen (Ordner: alle darunter); --force nur auf Wunsch/als Rückfall
 labvm shell NAME [cmd…]                Shell in der VM (startet sie bei Bedarf)
@@ -27,12 +27,13 @@ labvm pack|unpack [NAME|ORDNER…]       ohne Namen: alle gestoppten packen / al
 labvm autopack NAME on|off             Auto-Pack umschalten
 labvm mv QUELLE ZIEL                   verschieben/umbenennen (Ziel = bestehender Ordner → hinein). Lima-Name bleibt.
 labvm mkdir PFAD · labvm adopt LIMA-NAME PFAD · labvm info NAME · labvm doctor
+labvm image [--force]                 btrfs-Basisimage bauen (für new --compress fs)
 labvm provision NAME [--ai-only]       Standard-Ausstattung (erneut) anwenden, idempotent
 labvm rm NAME --yes                    VM unwiderruflich löschen (nur auf ausdrücklichen Wunsch!); leere Ordner ohne --yes
 ```
 Neue VM (Standard): Debian 13, XFCE-Desktop mit Autologin, **Chromium** (Standardbrowser, im Startmenü), Compiler (gcc, g++, clang, make, cmake, gdb …),
 großer Satz Unix-Werkzeuge, **Claude Code** und **Qwen Code** (+ OpenCode), Locale en_US mit deutschen Formaten/Tastatur, Zeitzone Berlin. `--no-gui` = ohne Desktop.
-Kompression `--compress fs` (btrfs im Gast) ist noch nicht verfügbar.
+Kompression: `--compress pack` (Standard: Platte nach dem Beenden mit zstd packen, ruhend ca. 2,4 GB), `--compress fs` (Root-Dateisystem btrfs mit zstd, komprimiert im laufenden Betrieb, kein Ent-/Packen; ruhend ca. 5 GB; baut beim ersten Mal einmalig das Image mit `labvm image`, ca. 10 Min.), `none`.
 
 ## Arbeitsweise
 1. Erst `labvm ls` (Zustand kennen). Bei unklarem Namen Kandidaten zeigen statt raten.

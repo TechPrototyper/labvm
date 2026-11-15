@@ -12,7 +12,7 @@ mkdir -p /var/lib/lab
 
 REQUIRED="build-essential gcc g++ clang lld gdb make cmake ninja-build pkg-config autoconf automake libtool bison flex nasm m4
   git git-lfs curl wget ca-certificates gnupg openssh-client rsync tmux screen vim nano less
-  man-db manpages manpages-dev manpages-posix manpages-posix-dev info
+  man-db manpages manpages-dev info
   coreutils util-linux procps psmisc lsof strace ltrace tcpdump netcat-openbsd socat bind9-dnsutils iproute2 iputils-ping
   traceroute mtr-tiny net-tools ethtool file tree jq ripgrep fd-find bat fzf htop ncdu
   zip unzip p7zip-full xz-utils bzip2 zstd lz4 gzip patch diffutils findutils gawk sed grep bc dc expect moreutils pv parallel
@@ -20,7 +20,7 @@ REQUIRED="build-essential gcc g++ clang lld gdb make cmake ninja-build pkg-confi
   python3 python3-pip python3-venv pipx perl bash-completion locales xdg-utils chromium"
 GUI_PKGS="xfce4 xfce4-terminal lightdm lightdm-gtk-greeter dbus-x11 xserver-xorg-core xserver-xorg-input-libinput
   x11-utils x11-xserver-utils xdotool fonts-dejavu fonts-liberation fonts-firacode mousepad zenity"
-OPTIONAL="valgrind ltrace btop iotop iftop dstat whois ftp telnet strace-doc libc6-dbg elfutils lynx wdiff"
+OPTIONAL="manpages-posix manpages-posix-dev valgrind ltrace btop iotop iftop dstat whois ftp telnet strace-doc libc6-dbg elfutils lynx wdiff"
 avail() { LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print ($2 != "(none)" && $2 != "")}' | grep -q 1; }
 
 log "apt update"; apt-get update -qq

@@ -652,6 +652,58 @@ def cmd_provision(a):
             do_pack(l)
 
 
+BTRFS_IMG = os.path.join(CACHE, "debian-13-btrfs.qcow2")
+
+
+def btrfs_image():
+    """(pfad, sha512) des selbst gebauten Debian-Images mit btrfs-Root (compress=zstd:3) oder None."""
+    sha_file = BTRFS_IMG + ".sha512"
+    if os.path.isfile(BTRFS_IMG) and os.path.isfile(sha_file):
+        return BTRFS_IMG, open(sha_file).read().split()[0]
+    return None
+
+
+def cmd_image(a):
+    """Debian-13-Image mit btrfs-Root bauen (einmalig, ca. 10 Min.): Helfer-VM, Skript profile/build-btrfs-image.sh, Ergebnis nach ~/.cache/lab."""
+    if btrfs_image() and not a.force:
+        log("btrfs-Image vorhanden: %s (neu bauen: --force)" % BTRFS_IMG)
+        return
+    helper = "labvm-imgbuild"
+    info = lima_list()
+    if helper in info:
+        die("Helfer-VM '%s' existiert noch (Rest eines früheren Laufs): limactl delete -f %s" % (helper, helper))
+    img = fetch_image()
+    cfg = {"minimumLimaVersion": "2.0.0", "vmType": "vz", "arch": "aarch64", "cpus": 4, "memory": "4GiB", "disk": "20GiB",
+           "images": [{"location": img, "arch": "aarch64", "digest": "sha512:" + DEBIAN_SHA512}], "mounts": [],
+           "video": {"display": "none"}, "containerd": {"system": False, "user": False}}
+    tmp = os.path.join(CACHE, "labvm-helper.yaml")
+    with open(tmp, "w") as f:
+        json.dump(cfg, f)
+    try:
+        log("Helfer-VM anlegen und starten")
+        run(["limactl", "create", "--tty=false", "--name=" + helper, tmp])
+        run(["limactl", "start", "--tty=false", helper])
+        log("Original-Image in die Helfer-VM kopieren")
+        run(["limactl", "copy", img, helper + ":/tmp/orig.qcow2"])
+        run(["limactl", "shell", "--workdir", "/", helper, "--", "sudo", "mv", "/tmp/orig.qcow2", "/var/tmp/orig.qcow2"])
+        log("Image umbauen (ext4 -> btrfs mit zstd)")
+        with open(os.path.join(PROFILE, "build-btrfs-image.sh")) as f:
+            r = subprocess.run(["limactl", "shell", "--workdir", "/", helper, "--", "sudo", "bash", "-s"], stdin=f)
+        if r.returncode != 0:
+            die("Image-Bau fehlgeschlagen")
+        out = BTRFS_IMG + ".part"
+        run(["limactl", "copy", helper + ":/var/tmp/debian-btrfs.qcow2", out])
+        sha = subprocess.run(["shasum", "-a", "512", out], capture_output=True, text=True).stdout.split()[0]
+        os.replace(out, BTRFS_IMG)
+        with open(BTRFS_IMG + ".sha512", "w") as f:
+            f.write(sha + "\n")
+        log("btrfs-Image fertig: %s (%s MB)" % (BTRFS_IMG, os.path.getsize(BTRFS_IMG) // 1_000_000))
+    finally:
+        subprocess.run(["limactl", "delete", "-f", helper], capture_output=True)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def cmd_new(a):
     data = load()
     info = lima_list()
@@ -665,9 +717,14 @@ def cmd_new(a):
     lima = a.lima or re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-")
     if lima in info:
         die("Lima-VM '%s' gibt es schon (--lima NAME wählt einen anderen Namen)" % lima)
+    img, digest = None, DEBIAN_SHA512
     if a.compress == "fs":
-        die("--compress fs (btrfs mit zstd im Gast) ist noch nicht verfügbar; vorerst pack (Standard) oder none")
-    img = fetch_image()
+        if not btrfs_image():
+            log("btrfs-Image fehlt - baue es einmalig (ca. 10 Min.)")
+            cmd_image(argparse.Namespace(force=False))
+        img, digest = btrfs_image()
+    else:
+        img = fetch_image()
     mounts = []
     share_dir = os.path.join(SHARE, path)          # alle Nutzdaten der VM liegen unter ~/LabShare/<Pfad> auf dem Mac
     if not a.no_share:
@@ -682,10 +739,9 @@ def cmd_new(a):
     cfg = {
         "minimumLimaVersion": "2.0.0", "vmType": "vz", "arch": "aarch64",
         "cpus": a.cpus, "memory": a.memory, "disk": a.disk,
-        "images": [{"location": img, "arch": "aarch64", "digest": "sha512:" + DEBIAN_SHA512}],
+        "images": [{"location": img, "arch": "aarch64", "digest": "sha512:" + digest}],
         "mountType": "virtiofs", "mounts": mounts,
         "video": {"display": "none" if a.no_gui else "vz"},
-        "message": "labvm-VM",
         "containerd": {"system": False, "user": False},
     }
     tmp = os.path.join(CACHE, "labvm-new-%d.yaml" % os.getpid())
@@ -759,7 +815,7 @@ def cmd_doctor(a):
 ZSH = r'''#compdef labvm
 _labvm() {
   local -a cmds paths
-  cmds=(ls mkdir mv adopt new provision start run stop shell pack unpack autopack info rm doctor completion)
+  cmds=(ls mkdir mv adopt new image provision start run stop shell pack unpack autopack info rm doctor completion)
   if (( CURRENT == 2 )); then _describe 'befehl' cmds; return; fi
   paths=(${(f)"$(labvm _paths 2>/dev/null)"})
   _describe 'vm oder ordner' paths
@@ -788,12 +844,13 @@ def build_parser():
     x = s.add_parser("new", help="neue Debian-13-VM anlegen")
     x.add_argument("path"); x.add_argument("--cpus", type=int, default=4); x.add_argument("--memory", default="4GiB"); x.add_argument("--disk", default="40GiB")
     x.add_argument("--compress", choices=["pack", "fs", "none"], default="pack",
-                   help="pack: Platte nach dem Beenden mit zstd packen (Standard); fs: btrfs mit zstd im Gast (noch nicht verfügbar); none")
+                   help="pack: Platte nach dem Beenden mit zstd packen (Standard); fs: Root-Dateisystem btrfs mit zstd, komprimiert im Betrieb; none")
     x.add_argument("--mount", action="append", metavar="MAC:VM", help="Mac-Ordner einbinden (mehrfach)")
     x.add_argument("--lima", help="Lima-Name statt aus dem Pfad abgeleitet"); x.add_argument("--no-gui", action="store_true")
     x.add_argument("--note"); x.add_argument("--start", action="store_true", help="nach dem Anlegen laufen lassen")
     x.add_argument("--no-provision", action="store_true", help="nur anlegen, keine Standard-Ausstattung installieren")
     x.add_argument("--no-share", action="store_true", help="keinen Mount ~/LabShare/<Pfad> -> /mnt/share"); x.set_defaults(f=cmd_new)
+    x = s.add_parser("image", help="btrfs-Basisimage bauen (für new --compress fs)"); x.add_argument("--force", action="store_true"); x.set_defaults(f=cmd_image)
     x = s.add_parser("provision", help="Standard-Ausstattung (Chromium, Compiler, Unix-Tools, Claude Code, Qwen Code) installieren/aktualisieren")
     x.add_argument("name"); x.add_argument("--no-gui", action="store_true"); x.add_argument("--ai-only", action="store_true", help="nur KI-Werkzeuge und Browser-Vorgabe")
     x.set_defaults(f=cmd_provision)

@@ -20,7 +20,7 @@ labvm stop 40c3                               # Ordner: alles darunter
 - **Packen**: `disk` → `disk.zst` (geprüft), `disk` wird Symlink auf `/dev/null`, damit ein versehentliches `limactl start` sicher scheitert. `limactl start` kehrt nach dem Hochfahren zurück; darum beobachtet ein Hintergrund-Wächter (`start`) bzw. der Vordergrundbefehl `run` das Ende und packt dann.
 - **Shared**: `~/LabShare/<Pfad>` (Mac) ↔ `/mnt/share` bzw. `~/share` (VM): alle Nutzdaten an einer Stelle auf dem Mac.
 - **Standard-Ausstattung** (`profile/`): Debian 13, XFCE + Autologin, Chromium (Standardbrowser, im Startmenü), build-essential/clang/gdb/cmake …, großer Satz Unix-Werkzeuge, Claude Code, Qwen Code, OpenCode; Locale en_US mit deutschen Formaten, Tastatur de, Berlin.
-- `--compress fs` (btrfs mit zstd im Gast) ist vorgesehen, siehe Notizen unten.
+- **Zwei Kompressionswege** bei `labvm new`: `--compress pack` (Standard): Platte wird nach dem Beenden gepackt (ruhend ≈ 2,4 GB für eine volle Standard-VM, Entpacken 15–30 s). `--compress fs`: Root-Dateisystem **btrfs mit `compress=zstd:3`** (aus einem einmalig gebauten Image, `labvm image`), komprimiert im Betrieb, TRIM (`discard=async`, `fstrim.timer`) gibt Platz an den Mac zurück; ruhend ≈ 5 GB. `--compress none` ohne beides.
 
 ## Installation
 ```bash
@@ -30,4 +30,4 @@ python3 -m unittest discover -s tests   # Tests mit falschem limactl
 Nur Python-Standardbibliothek.
 
 ## Grenzen
-Teilstring-Treffer sind bequem, aber nur eindeutig; Pfade erlauben `A-Za-z0-9._-`. Der Shared-Mount einer VM bleibt bei `mv` am alten Pfad. Eine gepackte VM nie per `limactl` starten.
+`fs` braucht für jedes neue Debian-Release ein neu gebautes Image (`labvm image --force`); gemessen nur mit Debian 13 arm64/vz. Teilstring-Treffer sind bequem, aber nur eindeutig; Pfade erlauben `A-Za-z0-9._-`. Der Shared-Mount einer VM bleibt bei `mv` am alten Pfad. Eine gepackte VM nie per `limactl` starten.
