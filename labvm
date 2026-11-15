@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""labvm - VM-Verwaltung für Lima auf dem Mac: Hierarchie (Ordner/Unterordner), Kurznamen, Platten packen (zstd).
+
+Lima kennt nur flache Namen. labvm führt daneben einen Baum (~/.config/labvm/tree.json), z. B.
+    labortage26/z80, labortage26/kubers, 40c3/workshop/vm1
+und löst Kurznamen auf: `labvm start kubers` genügt, solange er eindeutig ist (auch "kub", "26/kub", Lima-Name).
+Nur Python-Standardbibliothek; benötigt limactl, für Pack/Unpack zstd (brew install zstd).
+Befehle: siehe `labvm --help`.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "1.0"
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("LABVM_CONFIG", os.path.join(HOME, ".config", "labvm", "tree.json"))
+LIMA_HOME = os.environ.get("LIMA_HOME", os.path.join(HOME, ".lima"))
+LOG = os.path.join(HOME, "Library", "Logs", "labvm.log")
+SHARE = os.environ.get("LABVM_SHARE", os.path.join(HOME, "LabShare"))   # Mac-Ordner: bildet den VM-Baum ab
+PROFILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "profile")
+CACHE = os.path.join(HOME, ".cache", "lab")
+for _p in ("/opt/homebrew/bin", "/usr/local/bin"):
+    if _p not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = _p + ":" + os.environ.get("PATH", "")
+
+# Debian 13 (trixie) arm64 "generic" (normaler Kernel mit virtio-gpu), per SHA-512 gepinnt - wie in den Projekt-Repos
+DEBIAN_URL = "https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-generic-arm64-20261103-2651.qcow2"
+DEBIAN_SHA512 = ("878f563f6c95af7fe1e8e51cd39470a1cdb570dddbee22377c85a347bce9d521d95f2cf0f825a38bc0a757889034fac6d83e932f04a3a122ab08cea68cc9ff8a")
+
+TTY = sys.stdout.isatty()
+
+
+def c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if TTY else s
+
+
+def log(msg):
+    print(c("1;34", "==>"), msg, flush=True)
+
+
+def warn(msg):
+    print(c("1;33", "!!"), msg, file=sys.stderr, flush=True)
+
+
+def die(msg, code=1):
+    print(c("1;31", "xx"), msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# ----------------------------------------------------------------------------- Registry (Baum)
+def load():
+    if not os.path.exists(CONFIG):
+        return {"version": 1, "nodes": {}}
+    with open(CONFIG) as f:
+        data = json.load(f)
+    data.setdefault("nodes", {})
+    return data
+
+
+def save(data):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, CONFIG)
+
+
+def norm(path):
+    segs = [s for s in re.split(r"/+", path.strip()) if s]
+    for s in segs:
+        if s in (".", "..") or not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", s):
+            die("Ungültiger Pfadteil '%s' (erlaubt: Buchstaben, Ziffern, . _ -)" % s)
+    return "/".join(segs)
+
+
+def folders(data):
+    """Alle Ordner: explizit angelegte plus alle Elternpfade der VMs."""
+    out = set()
+    for p, n in data["nodes"].items():
+        segs = p.split("/")
+        upto = len(segs) if n["type"] == "folder" else len(segs) - 1
+        for i in range(1, upto + 1):
+            out.add("/".join(segs[:i]))
+    return out
+
+
+def vms(data):
+    return {p: n for p, n in data["nodes"].items() if n["type"] == "vm"}
+
+
+def match_segments(q, p, substring=False):
+    """q passt auf das Ende von p; jeder q-Teil ist Präfix (oder Teilstring) des entsprechenden p-Teils."""
+    if len(q) > len(p):
+        return False
+    tail = p[len(p) - len(q):]
+    return all((s in t) if substring else t.startswith(s) for s, t in zip(q, tail))
+
+
+def resolve(data, query, kind="any", lima_names=(), maxtier=2):
+    """Kurznamen auflösen. kind: any|vm|folder. Gibt (pfad, 'vm'|'folder'|'lima') zurück."""
+    q = norm(query)
+    if not q:
+        die("Leerer Name")
+    cands = {}
+    for p in vms(data):
+        cands[p] = "vm"
+    for p in folders(data):
+        cands.setdefault(p, "folder")
+    if kind != "any":
+        cands = {p: k for p, k in cands.items() if k == kind}
+    if q in cands:
+        return q, cands[q]
+    # Lima-Name exakt (registrierte VM)
+    if kind in ("any", "vm"):
+        for p, n in vms(data).items():
+            if n["lima"] == q:
+                return p, "vm"
+    qs = q.split("/")
+    for tier in range(maxtier + 1):   # 0: Teile exakt, 1: Teile als Präfix, 2: Teile als Teilstring
+        hits = []
+        for p, k in cands.items():
+            ps = p.split("/")
+            ok = (len(qs) <= len(ps) and ps[len(ps) - len(qs):] == qs) if tier == 0 else match_segments(qs, ps, tier == 2)
+            if not ok and tier >= 1 and len(qs) == 1 and k == "vm":      # auch der Lima-Name (Präfix/Teilstring)
+                ln = data["nodes"][p]["lima"]
+                ok = ln.startswith(q) if tier == 1 else q in ln
+            if ok:
+                hits.append(p)
+        if len(hits) == 1:
+            return hits[0], cands[hits[0]]
+        if len(hits) > 1:
+            die("'%s' ist nicht eindeutig: %s" % (query, ", ".join(sorted(hits))))
+    if kind in ("any", "vm") and q in lima_names:
+        return q, "lima"             # nicht einsortierte Lima-VM
+    die("'%s' nicht gefunden (labvm ls zeigt alles)" % query)
+
+
+def under(data, path):
+    """Alle VM-Pfade unter einem Ordner (oder die VM selbst)."""
+    return sorted(p for p in vms(data) if p == path or p.startswith(path + "/"))
+
+
+# ----------------------------------------------------------------------------- Lima
+def run(cmd, check=True, capture=False, **kw):
+    r = subprocess.run(cmd, check=False, text=True, capture_output=capture, **kw)
+    if check and r.returncode != 0:
+        die("%s fehlgeschlagen (%d)%s" % (" ".join(cmd[:3]), r.returncode, (": " + r.stderr.strip()) if capture and r.stderr else ""))
+    return r
+
+
+def need(tool, hint):
+    if not shutil.which(tool):
+        die("%s fehlt: %s" % (tool, hint))
+
+
+def lima_list():
+    """Name -> Info-Dict aus `limactl list --json` (NDJSON)."""
+    need("limactl", "brew install lima")
+    r = subprocess.run(["limactl", "list", "--json"], text=True, capture_output=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                d = json.loads(line)
+                out[d["name"]] = d
+            except Exception:
+                pass
+    return out
+
+
+def status_of(lima):
+    r = subprocess.run(["limactl", "list", "--format", "{{.Status}}", lima], text=True, capture_output=True)
+    s = r.stdout.strip()
+    return s if r.returncode == 0 and s else "Missing"
+
+
+def vmdir(lima):
+    return os.path.join(LIMA_HOME, lima)
+
+
+def is_packed(lima):
+    d = vmdir(lima)
+    return os.path.islink(os.path.join(d, "disk")) and os.path.isfile(os.path.join(d, "disk.zst"))
+
+
+def blocks_bytes(path):
+    try:
+        return os.lstat(path).st_blocks * 512
+    except OSError:
+        return 0
+
+
+def real_bytes(lima):
+    d = vmdir(lima)
+    p = os.path.join(d, "disk.zst") if is_packed(lima) else os.path.join(d, "disk")
+    return blocks_bytes(p)
+
+
+def gb(b):
+    return "%.1f" % (b / 1024 ** 3)
+
+
+class Lock:
+    def __init__(self, lima):
+        self.path = os.path.join(vmdir(lima), ".labvm.lock")
+
+    def __enter__(self):
+        self.f = open(self.path, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def do_pack(lima, level=3):
+    need("zstd", "brew install zstd")
+    d = vmdir(lima)
+    if not os.path.isdir(d):
+        die("Lima-VM '%s' unbekannt" % lima)
+    with Lock(lima):
+        if is_packed(lima):
+            log("%s: bereits gepackt" % lima)
+            return
+        st = status_of(lima)
+        if st != "Stopped":
+            die("%s: Status %s - zum Packen muss die VM gestoppt sein" % (lima, st))
+        disk = os.path.join(d, "disk")
+        if not os.path.isfile(disk) or os.path.islink(disk):
+            die("%s: keine Platte gefunden" % lima)
+        before = blocks_bytes(disk)
+        log("%s: packe (%s GB belegt) ..." % (lima, gb(before)))
+        part = os.path.join(d, "disk.zst.part")
+        with open(part, "wb") as out:
+            r = subprocess.run(["zstd", "-q", "-T0", "-%d" % level, "-c", disk], stdout=out)
+        if r.returncode != 0 or subprocess.run(["zstd", "-q", "-t", part]).returncode != 0:
+            if os.path.exists(part):
+                os.remove(part)
+            die("%s: Packen/Prüfen fehlgeschlagen, Platte bleibt unverändert" % lima)
+        os.replace(part, os.path.join(d, "disk.zst"))
+        os.remove(disk)
+        os.symlink("/dev/null", disk)     # ein versehentliches `limactl start` scheitert damit sicher
+        log("%s: gepackt, %s GB -> %s GB" % (lima, gb(before), gb(blocks_bytes(os.path.join(d, "disk.zst")))))
+
+
+def do_unpack(lima):
+    need("zstd", "brew install zstd")
+    d = vmdir(lima)
+    if not os.path.isdir(d):
+        die("Lima-VM '%s' unbekannt" % lima)
+    with Lock(lima):
+        if not is_packed(lima):
+            return
+        log("%s: packe aus ..." % lima)
+        part = os.path.join(d, "disk.part")
+        with open(part, "wb") as out:
+            r = subprocess.run(["zstd", "-q", "-d", "--sparse", "-c", os.path.join(d, "disk.zst")], stdout=out)
+        if r.returncode != 0 or os.path.getsize(part) < 1_000_000:
+            if os.path.exists(part):
+                os.remove(part)
+            die("%s: Auspacken fehlgeschlagen, gepacktes Archiv bleibt erhalten" % lima)
+        os.remove(os.path.join(d, "disk"))
+        os.replace(part, os.path.join(d, "disk"))
+        os.remove(os.path.join(d, "disk.zst"))
+        log("%s: ausgepackt (%s GB belegt)" % (lima, gb(blocks_bytes(os.path.join(d, "disk")))))
+
+
+def pidfile(lima):
+    return os.path.join(vmdir(lima), ".labvm-watch.pid")
+
+
+def watcher_alive(lima):
+    try:
+        pid = int(open(pidfile(lima)).read().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def wait_stopped(lima):
+    while status_of(lima) in ("Running", "Stopping", "Starting"):
+        time.sleep(5)
+
+
+def entry_for(data, path):
+    return data["nodes"].get(path, {"lima": path, "autopack": False})
+
+
+def start_vm(data, path, lima, wait=False):
+    """Auspacken, starten; danach packt ein Wächter (oder wir selbst bei wait=True) nach dem Beenden wieder ein."""
+    st = status_of(lima)
+    if st == "Missing":
+        die("Lima-VM '%s' existiert nicht (mehr)" % lima)
+    auto = entry_for(data, path).get("autopack", False)
+    if st != "Running":
+        do_unpack(lima)
+        log("%s: starte" % lima)
+        run(["limactl", "start", "--tty=false", lima])
+    else:
+        log("%s: läuft bereits" % lima)
+    if wait:
+        wait_stopped(lima)
+        log("%s: beendet (Status %s)" % (lima, status_of(lima)))
+        if auto and status_of(lima) == "Stopped":
+            do_pack(lima)
+    elif auto and not watcher_alive(lima):
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        lf = open(LOG, "a")
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_watch", lima], stdin=subprocess.DEVNULL,
+                             stdout=lf, stderr=lf, start_new_session=True)
+        with open(pidfile(lima), "w") as f:
+            f.write(str(p.pid))
+        log("%s: Wächter läuft im Hintergrund (packt nach dem Beenden automatisch, Log: %s)" % (lima, LOG))
+
+
+# ----------------------------------------------------------------------------- Befehle
+def cmd_ls(a):
+    data = load()
+    info = lima_list()
+    reg_lima = {n["lima"] for n in vms(data).values()}
+
+    def node_info(path):
+        n = data["nodes"][path]
+        l = n["lima"]
+        st = info.get(l, {}).get("status", "fehlt")
+        z = "gepackt" if is_packed(l) else "ausgepackt"
+        return (st, z, real_bytes(l), n)
+
+    root = norm(a.path) if a.path else ""
+    if root:
+        root, _ = resolve(data, root, "folder")
+    prefix = root + "/" if root else ""
+    # Baum aus Pfaden
+    tree = {}
+    for p in sorted(vms(data)):
+        if root and not p.startswith(prefix):
+            continue
+        t = tree
+        for s in p[len(prefix):].split("/"):
+            t = t.setdefault(s, {})
+    for f in folders(data):
+        if (not root or f.startswith(prefix)) and f != root:
+            t = tree
+            for s in f[len(prefix):].split("/"):
+                t = t.setdefault(s, {})
+    lines = []
+
+    def total_under(path):
+        return sum(real_bytes(data["nodes"][p]["lima"]) for p in under(data, path))
+
+    def walk(t, base, indent):
+        keys = sorted(t, key=lambda k: (data["nodes"].get(base + k, {}).get("type") == "vm", k))
+        for i, k in enumerate(keys):
+            full = base + k
+            last = i == len(keys) - 1
+            branch = ("└── " if last else "├── ") if indent is not None else ""
+            pre = (indent or "") + branch
+            nxt = (indent or "") + ("    " if last else "│   ") if indent is not None else ""
+            if data["nodes"].get(full, {}).get("type") == "vm":
+                st, z, b, n = node_info(full)
+                flags = []
+                if n.get("autopack"):
+                    flags.append("auto-pack")
+                if n.get("compress") == "fs":
+                    flags.append("btrfs-zstd")
+                extra = ("  [" + ", ".join(flags) + "]") if flags else ""
+                col = "32" if st == "Running" else "90"
+                lima_note = "" if n["lima"] == k else "  (%s)" % n["lima"]
+                lines.append((pre + k + lima_note, c(col, st), z, gb(b), extra))
+            else:
+                lines.append((pre + c("1", k + "/"), "", "", gb(total_under(full)), ""))
+                walk(t[k], full + "/", nxt)
+
+    walk(tree, prefix, "")
+    w = max([len(re.sub(r"\033\[[0-9;]*m", "", l[0])) for l in lines] + [10])
+    print("%-*s  %-9s %-11s %7s" % (w, "VM", "STATUS", "ZUSTAND", "MAC-GB"))
+    for l in lines:
+        vis = len(re.sub(r"\033\[[0-9;]*m", "", l[0]))
+        stv = re.sub(r"\033\[[0-9;]*m", "", l[1])
+        print("%s%s  %s%s %-11s %7s%s" % (l[0], " " * (w - vis), l[1], " " * max(0, 9 - len(stv)), l[2], l[3], l[4]))
+    total = sum(real_bytes(n["lima"]) for p, n in vms(data).items() if not root or p.startswith(prefix))
+    print("%-*s  %-9s %-11s %7s" % (w, "Summe", "", "", gb(total)))
+    loose = sorted(set(info) - reg_lima)
+    if loose and not root:
+        print("\nNicht einsortiert (labvm adopt <lima-name> <pfad>): " + ", ".join(loose))
+
+
+def cmd_mkdir(a):
+    data = load()
+    p = norm(a.path)
+    if p in data["nodes"] and data["nodes"][p]["type"] == "vm":
+        die("'%s' ist eine VM" % p)
+    for i in range(1, len(p.split("/")) + 1):
+        q = "/".join(p.split("/")[:i])
+        if data["nodes"].get(q, {}).get("type") == "vm":
+            die("'%s' ist eine VM, kein Ordner" % q)
+    data["nodes"].setdefault(p, {"type": "folder"})
+    save(data)
+    log("Ordner %s/" % p)
+
+
+def cmd_mv(a):
+    data = load()
+    info = lima_list()
+    src, kind = resolve(data, a.src, "any", set(info))
+    if kind == "lima":
+        die("'%s' ist nicht einsortiert - erst `labvm adopt`" % a.src)
+    dst = norm(a.dst)
+    if dst in folders(data) and dst != src:
+        dst = dst + "/" + src.split("/")[-1]
+    if dst == src:
+        die("Quelle und Ziel gleich")
+    if dst.startswith(src + "/"):
+        die("Ein Ordner kann nicht in sich selbst verschoben werden")
+    moved = {p: n for p, n in data["nodes"].items() if p == src or p.startswith(src + "/")}
+    if kind == "folder":   # implizite Ordner (nur durch VMs entstanden) mitnehmen
+        for p in under(data, src):
+            moved.setdefault(p, data["nodes"][p])
+    for p in moved:
+        np_ = dst + p[len(src):]
+        if np_ in data["nodes"] and np_ not in moved:
+            die("Ziel '%s' existiert bereits" % np_)
+        if data["nodes"].get(np_.rsplit("/", 1)[0], {}).get("type") == "vm":
+            die("Zielelternteil ist eine VM")
+    for p in moved:
+        del data["nodes"][p]
+    for p, n in moved.items():
+        data["nodes"][dst + p[len(src):]] = n
+    save(data)
+    log("%s -> %s" % (src, dst))
+
+
+def cmd_adopt(a):
+    data = load()
+    info = lima_list()
+    if a.lima not in info:
+        die("Lima-VM '%s' gibt es nicht. Vorhanden: %s" % (a.lima, ", ".join(sorted(info)) or "-"))
+    path = norm(a.path)
+    if path in data["nodes"] or path in folders(data):
+        die("'%s' ist schon belegt" % path)
+    if any(n["lima"] == a.lima for n in vms(data).values()):
+        die("Lima-VM '%s' ist schon einsortiert" % a.lima)
+    data["nodes"][path] = {"type": "vm", "lima": a.lima, "autopack": not a.no_autopack,
+                           "compress": "pack" if not a.no_autopack else "none"}
+    save(data)
+    log("%s = Lima-VM %s" % (path, a.lima))
+
+
+def targets(data, queries, allow_folder=True):
+    info = lima_list()
+    out = []
+    for q in queries:
+        p, kind = resolve(data, q, "any" if allow_folder else "vm", set(info))
+        if kind == "lima":
+            out.append((p, p))
+        elif kind == "folder":
+            out += [(x, data["nodes"][x]["lima"]) for x in under(data, p)]
+        else:
+            out.append((p, data["nodes"][p]["lima"]))
+    seen, uniq = set(), []
+    for t in out:
+        if t[1] not in seen:
+            seen.add(t[1])
+            uniq.append(t)
+    return uniq
+
+
+def cmd_pack(a):
+    data = load()
+    qs = a.names or [""]
+    ts = [(p, n["lima"]) for p, n in sorted(vms(data).items())] if not a.names else targets(data, a.names)
+    for p, l in ts:
+        if status_of(l) != "Stopped" and not a.names:
+            continue     # ohne Namen: nur gestoppte VMs
+        do_pack(l, a.level)
+
+
+def cmd_unpack(a):
+    data = load()
+    ts = [(p, n["lima"]) for p, n in sorted(vms(data).items())] if not a.names else targets(data, a.names)
+    for p, l in ts:
+        do_unpack(l)
+
+
+def cmd_start(a):
+    data = load()
+    (p, l), = targets(data, [a.name], allow_folder=False)
+    start_vm(data, p, l, wait=a.wait)
+
+
+def cmd_run(a):
+    data = load()
+    (p, l), = targets(data, [a.name], allow_folder=False)
+    start_vm(data, p, l, wait=True)
+
+
+def cmd_stop(a):
+    data = load()
+    for p, l in targets(data, a.names):
+        st = status_of(l)
+        if st == "Running":
+            log("%s: stoppe" % l)
+            cmd = ["limactl", "stop"] + (["--force"] if a.force else []) + [l]
+            r = run(cmd, check=False)
+            if r.returncode != 0:
+                warn("%s ließ sich nicht sauber stoppen. Erneut mit `labvm stop --force %s` (hartes Beenden)." % (l, p))
+                continue
+        else:
+            log("%s: %s" % (l, st))
+        if entry_for(data, p).get("autopack") and status_of(l) == "Stopped" and not watcher_alive(l):
+            do_pack(l)
+
+
+def cmd_shell(a):
+    data = load()
+    (p, l), = targets(data, [a.name], allow_folder=False)
+    if status_of(l) != "Running":
+        start_vm(data, p, l)
+    os.execvp("limactl", ["limactl", "shell", l] + (["--"] + a.cmd if a.cmd else []))
+
+
+def cmd_autopack(a):
+    data = load()
+    (p, l), = targets(data, [a.name], allow_folder=False)
+    if p not in data["nodes"]:
+        die("'%s' ist nicht einsortiert" % p)
+    data["nodes"][p]["autopack"] = a.mode == "on"
+    save(data)
+    log("%s: auto-pack %s" % (p, a.mode))
+
+
+def cmd_info(a):
+    data = load()
+    (p, l), = targets(data, [a.name], allow_folder=False)
+    n = entry_for(data, p)
+    st = status_of(l)
+    print("Pfad:       %s" % p)
+    print("Lima-Name:  %s (Status %s)" % (l, st))
+    print("Platte:     %s, %s GB real auf dem Mac" % ("gepackt" if is_packed(l) else "ausgepackt", gb(real_bytes(l))))
+    print("Kompression:%s auto-pack=%s" % (" " + str(n.get("compress", "-")), n.get("autopack")))
+    print("Verzeichnis:%s" % (" " + vmdir(l)))
+    if n.get("note"):
+        print("Notiz:      %s" % n["note"])
+
+
+def cmd_rm(a):
+    data = load()
+    info = lima_list()
+    p, kind = resolve(data, a.name, "any", set(info), maxtier=1)   # beim Löschen kein Teilstring-Raten
+    if kind == "folder":
+        if under(data, p):
+            die("Ordner '%s' ist nicht leer (%s)" % (p, ", ".join(under(data, p))))
+        data["nodes"].pop(p, None)
+        save(data)
+        log("Ordner %s/ entfernt" % p)
+        return
+    l = data["nodes"][p]["lima"] if kind == "vm" else p
+    if not a.yes:
+        die("Löscht VM '%s' (Lima '%s') samt Platte unwiderruflich. Zum Bestätigen: labvm rm --yes %s" % (p, l, a.name))
+    if status_of(l) == "Running":
+        die("'%s' läuft - erst stoppen" % l)
+    subprocess.run(["limactl", "unprotect", l], capture_output=True)
+    run(["limactl", "delete", "-f", l])
+    data["nodes"].pop(p, None)
+    save(data)
+    log("%s gelöscht" % p)
+
+
+def fetch_image():
+    img = os.path.join(CACHE, os.path.basename(DEBIAN_URL))
+    os.makedirs(CACHE, exist_ok=True)
+
+    def sha_ok(path):
+        r = subprocess.run(["shasum", "-a", "512", path], capture_output=True, text=True)
+        return r.stdout.split()[0] == DEBIAN_SHA512 if r.returncode == 0 and r.stdout else False
+    if os.path.isfile(img) and sha_ok(img):
+        return img
+    log("Lade %s (fortsetzbar)" % os.path.basename(img))
+    for _ in range(6):
+        r = subprocess.run(["curl", "-4", "-fL", "--connect-timeout", "20", "--speed-limit", "50000", "--speed-time", "30",
+                            "-C", "-", "-o", img + ".part", DEBIAN_URL])
+        if r.returncode == 0:
+            break
+    if not os.path.isfile(img + ".part") or not sha_ok(img + ".part"):
+        die("Image-Download oder Prüfsumme fehlgeschlagen")
+    os.replace(img + ".part", img)
+    return img
+
+
+def vm_user(lima):
+    r = subprocess.run(["limactl", "shell", "--workdir", "/", lima, "--", "id", "-un"], capture_output=True, text=True)
+    return r.stdout.strip() or "lima"
+
+
+def sh_in_vm(lima, script, root=False, env=None):
+    """Skriptdatei in der VM ausführen (als root oder Benutzer); Ausgabe live."""
+    cmd = ["limactl", "shell", "--workdir", "/", lima, "--"]
+    if root:
+        cmd += ["sudo", "env"] + ["%s=%s" % kv for kv in (env or {}).items()]
+    cmd += ["bash", "-s"]
+    with open(script) as f:
+        r = subprocess.run(cmd, stdin=f)
+    return r.returncode
+
+
+def provision_vm(lima, gui=True, ai_only=False):
+    """Standard-Ausstattung (profile/): Compiler, Unix-Werkzeuge, Chromium, Claude Code, Qwen Code. Idempotent."""
+    if not os.path.isdir(PROFILE):
+        die("Profil-Ordner fehlt: %s" % PROFILE)
+    if status_of(lima) != "Running":
+        die("%s läuft nicht" % lima)
+    user = vm_user(lima)
+    if not ai_only:
+        log("%s: Standard-Ausstattung (Systempakete, Chromium, Compiler, Unix-Werkzeuge)" % lima)
+        if sh_in_vm(lima, os.path.join(PROFILE, "base-system.sh"), root=True, env={"LAB_USER": user, "GUI": "1" if gui else "0"}):
+            die("base-system.sh fehlgeschlagen")
+    log("%s: Node.js (root)" % lima)
+    if sh_in_vm(lima, os.path.join(PROFILE, "ai-root.sh"), root=True):
+        die("ai-root.sh fehlgeschlagen")
+    log("%s: Claude Code, Qwen Code, OpenCode, Browser-Vorgabe (%s)" % (lima, user))
+    if sh_in_vm(lima, os.path.join(PROFILE, "base-user.sh")):
+        die("base-user.sh fehlgeschlagen")
+    r = subprocess.run(["limactl", "shell", "--workdir", "/", lima, "--", "cat", "/var/lib/lab/needs-reboot"], capture_output=True, text=True)
+    if r.stdout.strip() == "1":
+        log("%s: Neustart (Locale/Desktop)" % lima)
+        run(["limactl", "stop", lima])
+        run(["limactl", "start", "--tty=false", lima])
+        subprocess.run(["limactl", "shell", "--workdir", "/", lima, "--", "sudo", "rm", "-f", "/var/lib/lab/needs-reboot"])
+
+
+def cmd_provision(a):
+    data = load()
+    (p, l), = targets(data, [a.name], allow_folder=False)
+    was_running = status_of(l) == "Running"
+    if not was_running:
+        do_unpack(l)
+        run(["limactl", "start", "--tty=false", l])
+    provision_vm(l, gui=not a.no_gui, ai_only=a.ai_only)
+    if not was_running:
+        run(["limactl", "stop", l])
+        if entry_for(data, p).get("autopack"):
+            do_pack(l)
+
+
+def cmd_new(a):
+    data = load()
+    info = lima_list()
+    path = norm(a.path)
+    if path in data["nodes"] or path in folders(data):
+        die("'%s' existiert bereits" % path)
+    segs = path.split("/")
+    for i in range(1, len(segs)):
+        if data["nodes"].get("/".join(segs[:i]), {}).get("type") == "vm":
+            die("'%s' ist eine VM" % "/".join(segs[:i]))
+    lima = a.lima or re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-")
+    if lima in info:
+        die("Lima-VM '%s' gibt es schon (--lima NAME wählt einen anderen Namen)" % lima)
+    if a.compress == "fs":
+        die("--compress fs (btrfs mit zstd im Gast) ist noch nicht verfügbar; vorerst pack (Standard) oder none")
+    img = fetch_image()
+    mounts = []
+    share_dir = os.path.join(SHARE, path)          # alle Nutzdaten der VM liegen unter ~/LabShare/<Pfad> auf dem Mac
+    if not a.no_share:
+        os.makedirs(share_dir, exist_ok=True)
+        mounts.append({"location": share_dir, "mountPoint": "/mnt/share", "writable": True})
+    for m in a.mount or []:
+        host, _, guest = m.partition(":")
+        if not guest:
+            die("--mount erwartet MACPFAD:VMPFAD")
+        os.makedirs(os.path.expanduser(host), exist_ok=True)
+        mounts.append({"location": os.path.expanduser(host), "mountPoint": guest, "writable": True})
+    cfg = {
+        "minimumLimaVersion": "2.0.0", "vmType": "vz", "arch": "aarch64",
+        "cpus": a.cpus, "memory": a.memory, "disk": a.disk,
+        "images": [{"location": img, "arch": "aarch64", "digest": "sha512:" + DEBIAN_SHA512}],
+        "mountType": "virtiofs", "mounts": mounts,
+        "video": {"display": "none" if a.no_gui else "vz"},
+        "message": "labvm-VM",
+        "containerd": {"system": False, "user": False},
+    }
+    tmp = os.path.join(CACHE, "labvm-new-%d.yaml" % os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(cfg, f)       # JSON ist gültiges YAML
+    log("Lege Lima-VM '%s' an" % lima)
+    run(["limactl", "create", "--tty=false", "--name=" + lima, tmp])
+    os.remove(tmp)
+    subprocess.run(["limactl", "protect", lima], capture_output=True)
+    data["nodes"][path] = {"type": "vm", "lima": lima, "compress": a.compress, "autopack": a.compress == "pack",
+                           "note": a.note or "", "share": None if a.no_share else share_dir}
+    save(data)
+    log("%s angelegt (Kompression: %s)." % (path, a.compress))
+    if not a.no_provision:
+        log("Erster Start und Standard-Ausstattung (dauert einige Minuten) ...")
+        run(["limactl", "start", "--tty=false", lima])
+        provision_vm(lima, gui=not a.no_gui)
+        if not a.start:
+            log("%s: stoppe" % lima)
+            run(["limactl", "stop", lima])
+            if a.compress == "pack":
+                do_pack(lima)
+        else:
+            start_vm(data, path, lima)           # läuft bereits; startet ggf. den Wächter
+    elif a.start:
+        start_vm(data, path, lima)
+    log("Fertig. Start: labvm start %s" % path)
+
+
+def cmd_watch(a):
+    """Interner Hintergrund-Wächter: wartet bis die VM beendet ist und packt sie dann."""
+    lima = a.lima
+    data = load()
+    path = next((p for p, n in vms(data).items() if n["lima"] == lima), lima)
+    print(time.strftime("%F %T"), "Wächter für", lima, flush=True)
+    try:
+        wait_stopped(lima)
+        if status_of(lima) == "Stopped" and entry_for(load(), path).get("autopack"):
+            do_pack(lima)
+    finally:
+        try:
+            os.remove(pidfile(lima))
+        except OSError:
+            pass
+
+
+def cmd_paths(a):
+    data = load()
+    for p in sorted(set(vms(data)) | folders(data)):
+        print(p)
+    for n in vms(data).values():
+        print(n["lima"])
+
+
+def cmd_doctor(a):
+    ok = True
+    for tool, hint in (("limactl", "brew install lima"), ("zstd", "brew install zstd")):
+        found = shutil.which(tool)
+        print(("OK   " if found else "FEHLT"), tool, found or hint)
+        ok = ok and bool(found)
+    print("OK   " if os.path.isdir(LIMA_HOME) else "FEHLT", "LIMA_HOME", LIMA_HOME)
+    print("INFO Baum:", CONFIG)
+    data = load()
+    for p, n in sorted(vms(data).items()):
+        if not os.path.isdir(vmdir(n["lima"])):
+            print("FEHLT", p, "-> Lima-VM", n["lima"], "existiert nicht mehr (labvm rm --yes", p, "räumt den Eintrag auf)")
+            ok = False
+    sys.exit(0 if ok else 1)
+
+
+ZSH = r'''#compdef labvm
+_labvm() {
+  local -a cmds paths
+  cmds=(ls mkdir mv adopt new provision start run stop shell pack unpack autopack info rm doctor completion)
+  if (( CURRENT == 2 )); then _describe 'befehl' cmds; return; fi
+  paths=(${(f)"$(labvm _paths 2>/dev/null)"})
+  _describe 'vm oder ordner' paths
+}
+compdef _labvm labvm
+'''
+
+
+def cmd_completion(a):
+    if a.shell != "zsh":
+        die("Nur zsh: source <(labvm completion zsh)")
+    print(ZSH)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="labvm", description="Lima-VMs mit Hierarchie, Kurznamen und Plattenkompression (v%s)" % VERSION,
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="Beispiele:\n  labvm ls\n  labvm new 40c3/workshop/vm1 --cpus 4 --memory 8GiB\n  labvm start kubers        # Kurzname genügt\n  labvm mv fsre 40c3        # in anderen Ordner\n  labvm stop 26             # Ordner: alle darunter\n  labvm pack                # alle gestoppten VMs packen")
+    p.add_argument("--version", action="version", version=VERSION)
+    s = p.add_subparsers(dest="cmd")
+    x = s.add_parser("ls", aliases=["list", "tree"], help="Baum mit Status, Zustand, Platzbedarf"); x.add_argument("path", nargs="?"); x.set_defaults(f=cmd_ls)
+    x = s.add_parser("mkdir", help="Ordner anlegen"); x.add_argument("path"); x.set_defaults(f=cmd_mkdir)
+    x = s.add_parser("mv", help="VM oder Ordner verschieben/umbenennen (Lima-Name bleibt)"); x.add_argument("src"); x.add_argument("dst"); x.set_defaults(f=cmd_mv)
+    x = s.add_parser("adopt", help="vorhandene Lima-VM in den Baum aufnehmen"); x.add_argument("lima"); x.add_argument("path")
+    x.add_argument("--no-autopack", action="store_true"); x.set_defaults(f=cmd_adopt)
+    x = s.add_parser("new", help="neue Debian-13-VM anlegen")
+    x.add_argument("path"); x.add_argument("--cpus", type=int, default=4); x.add_argument("--memory", default="4GiB"); x.add_argument("--disk", default="40GiB")
+    x.add_argument("--compress", choices=["pack", "fs", "none"], default="pack",
+                   help="pack: Platte nach dem Beenden mit zstd packen (Standard); fs: btrfs mit zstd im Gast (noch nicht verfügbar); none")
+    x.add_argument("--mount", action="append", metavar="MAC:VM", help="Mac-Ordner einbinden (mehrfach)")
+    x.add_argument("--lima", help="Lima-Name statt aus dem Pfad abgeleitet"); x.add_argument("--no-gui", action="store_true")
+    x.add_argument("--note"); x.add_argument("--start", action="store_true", help="nach dem Anlegen laufen lassen")
+    x.add_argument("--no-provision", action="store_true", help="nur anlegen, keine Standard-Ausstattung installieren")
+    x.add_argument("--no-share", action="store_true", help="keinen Mount ~/LabShare/<Pfad> -> /mnt/share"); x.set_defaults(f=cmd_new)
+    x = s.add_parser("provision", help="Standard-Ausstattung (Chromium, Compiler, Unix-Tools, Claude Code, Qwen Code) installieren/aktualisieren")
+    x.add_argument("name"); x.add_argument("--no-gui", action="store_true"); x.add_argument("--ai-only", action="store_true", help="nur KI-Werkzeuge und Browser-Vorgabe")
+    x.set_defaults(f=cmd_provision)
+    x = s.add_parser("start", help="auspacken und starten (Wächter packt nach dem Beenden)"); x.add_argument("name")
+    x.add_argument("--wait", action="store_true", help="im Vordergrund bleiben, bis die VM beendet ist"); x.set_defaults(f=cmd_start)
+    x = s.add_parser("run", help="wie start --wait (für Start-Apps)"); x.add_argument("name"); x.set_defaults(f=cmd_run)
+    x = s.add_parser("stop", help="stoppen (Ordner: alle darunter) und ggf. packen"); x.add_argument("names", nargs="+")
+    x.add_argument("--force", action="store_true", help="hart beenden (limactl stop --force)"); x.set_defaults(f=cmd_stop)
+    x = s.add_parser("shell", help="Shell in der VM (startet sie bei Bedarf)"); x.add_argument("name"); x.add_argument("cmd", nargs=argparse.REMAINDER); x.set_defaults(f=cmd_shell)
+    x = s.add_parser("pack", help="gestoppte VMs packen (ohne Namen: alle gestoppten)"); x.add_argument("names", nargs="*")
+    x.add_argument("--level", type=int, default=3); x.set_defaults(f=cmd_pack)
+    x = s.add_parser("unpack", help="auspacken (ohne Namen: alle)"); x.add_argument("names", nargs="*"); x.set_defaults(f=cmd_unpack)
+    x = s.add_parser("autopack", help="Auto-Pack einer VM ein-/ausschalten"); x.add_argument("name"); x.add_argument("mode", choices=["on", "off"]); x.set_defaults(f=cmd_autopack)
+    x = s.add_parser("info", help="Details einer VM"); x.add_argument("name"); x.set_defaults(f=cmd_info)
+    x = s.add_parser("rm", help="VM (mit --yes) oder leeren Ordner löschen"); x.add_argument("name"); x.add_argument("--yes", action="store_true"); x.set_defaults(f=cmd_rm)
+    x = s.add_parser("doctor", help="Voraussetzungen und Baum prüfen"); x.set_defaults(f=cmd_doctor)
+    x = s.add_parser("completion", help="zsh-Vervollständigung: source <(labvm completion zsh)"); x.add_argument("shell", nargs="?", default="zsh"); x.set_defaults(f=cmd_completion)
+    x = s.add_parser("_watch"); x.add_argument("lima"); x.set_defaults(f=cmd_watch)
+    x = s.add_parser("_paths"); x.set_defaults(f=cmd_paths)
+    return p
+
+
+def main(argv=None):
+    p = build_parser()
+    a = p.parse_args(argv)
+    if not getattr(a, "f", None):
+        a = p.parse_args(["ls"])
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()
